@@ -574,6 +574,8 @@ struct haptics_play_info {
 struct haptics_hw_config {
 	struct brake_cfg	brake;
 	u32			vmax_mv;
+	u32			vmax_mv_constant;
+	u32			vmax_mv_cali;
 	u32			t_lra_us;
 	u32			cl_t_lra_us;
 	u32			lra_min_mohms;
@@ -2188,7 +2190,7 @@ static int haptics_set_fifo(struct haptics_chip *chip, struct fifo_cfg *fifo)
 static int haptics_load_constant_effect(struct haptics_chip *chip, u8 amplitude)
 {
 	struct haptics_play_info *play = &chip->play;
-	u32 hdrm_mv, vmax_mv = chip->config.vmax_mv;
+	u32 hdrm_mv, vmax_mv = chip->config.vmax_mv_constant;
 	int rc = 0;
 
 	mutex_lock(&chip->play.lock);
@@ -2681,7 +2683,7 @@ static int haptics_upload_effect(struct input_dev *dev,
 		dev_dbg(chip->dev, "upload constant effect, length = %dms, amplitude = %#x\n",
 				length_ms, amplitude);
 		schedule_delayed_work(&chip->stop_work, msecs_to_jiffies(length_ms));
-		haptics_load_constant_effect(chip, amplitude);
+		rc = haptics_load_constant_effect(chip, amplitude);
 		if (rc < 0) {
 			dev_err(chip->dev, "set direct play failed, rc=%d\n",
 					rc);
@@ -4682,6 +4684,26 @@ static int haptics_parse_dt(struct haptics_chip *chip)
 		goto free_pbs;
 	}
 
+	config->vmax_mv_constant = config->vmax_mv;
+	of_property_read_u32(node, "qcom,vmax-mv-constant",
+			&config->vmax_mv_constant);
+	if (config->vmax_mv_constant >= MAX_VMAX_MV) {
+		dev_err(chip->dev, "Invalid constant Vmax: %u mV\n",
+				config->vmax_mv_constant);
+		rc = -EINVAL;
+		goto free_pbs;
+	}
+
+	config->vmax_mv_cali = config->vmax_mv;
+	of_property_read_u32(node, "qcom,vmax-mv-cali",
+			&config->vmax_mv_cali);
+	if (config->vmax_mv_cali >= MAX_VMAX_MV) {
+		dev_err(chip->dev, "Invalid calibration Vmax: %u mV\n",
+				config->vmax_mv_cali);
+		rc = -EINVAL;
+		goto free_pbs;
+	}
+
 	config->fifo_empty_thresh = get_fifo_empty_threshold(chip);
 	of_property_read_u32(node, "qcom,fifo-empty-threshold",
 			&config->fifo_empty_thresh);
@@ -5267,7 +5289,7 @@ static int haptics_detect_lra_frequency(struct haptics_chip *chip)
 {
 	int rc;
 	u8 autores_cfg, drv_duty_cfg, amplitude, mask, val = 0;
-	u32 vmax_mv = chip->config.vmax_mv;
+	u32 vmax_mv = chip->config.vmax_mv_cali;
 
 	rc = haptics_read(chip, chip->cfg_addr_base,
 			HAP_CFG_AUTORES_CFG_REG, &autores_cfg, 1);
