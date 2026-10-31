@@ -5,6 +5,9 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/blkdev.h>
+#include <linux/buffer_head.h>
+#include <linux/compat.h>
 #include <linux/debugfs.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -15,13 +18,18 @@
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
+#include <linux/miscdevice.h>
+#include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mount.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/realitytap.h>
 #include <linux/regulator/driver.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
@@ -598,6 +606,28 @@ struct custom_fifo_data {
 	u8	*data;
 };
 
+struct haptics_chip;
+
+struct realitytap {
+	struct miscdevice misc;
+	struct kref ref;
+	struct mutex lock;
+	struct haptics_chip *chip;
+	struct work_struct stream_work;
+	struct work_struct erase_work;
+	struct realitytap_buffer *buffers;
+	u8 *scratch;
+	u32 scratch_size;
+	u32 index;
+	u32 position;
+	u32 pending;
+	u32 vmax_mv;
+	atomic_t active;
+	atomic_t stopping;
+	bool draining;
+	bool suspended;
+};
+
 struct haptics_chip {
 	struct device			*dev;
 	struct regmap			*regmap;
@@ -619,7 +649,10 @@ struct haptics_chip {
 	struct hrtimer			hbst_off_timer;
 	struct notifier_block		hboost_nb;
 	struct mutex			vmax_lock;
+	struct mutex			f0_lock;
 	struct work_struct		set_gain_work;
+	struct realitytap		*realitytap;
+	u32				f0_period_us;
 	int				fifo_empty_irq;
 	u32				hpwr_voltage_mv;
 	u32				effects_count;
@@ -643,7 +676,101 @@ struct haptics_chip {
 	bool				hpwr_vreg_enabled;
 	bool				is_hv_haptics;
 	bool				hboost_enabled;
+	bool				meizu_haptics;
+	bool				f0_calibrating;
 };
+
+#define MEIZU_F0_SLOT		72
+#define MEIZU_F0_SLOT_SIZE	64
+#define MEIZU_F0_MIN_PERIOD_US	5525
+#define MEIZU_F0_MAX_PERIOD_US	6250
+#define MEIZU_F0_DEFAULT_PERIOD_US	5880
+#define MEIZU_F0_ATTEMPTS		5
+
+static bool meizu_f0_valid(u32 period_us)
+{
+	return period_us >= MEIZU_F0_MIN_PERIOD_US &&
+		period_us <= MEIZU_F0_MAX_PERIOD_US;
+}
+
+static bool realitytap_active(struct haptics_chip *chip)
+{
+	return chip->realitytap && (atomic_read(&chip->realitytap->active) ||
+		atomic_read(&chip->realitytap->stopping));
+}
+
+static int meizu_f0_slot_rw(char *data, bool write)
+{
+#if IS_ENABLED(CONFIG_BLOCK)
+	const loff_t offset = MEIZU_F0_SLOT * 1024;
+	struct block_device *bdev;
+	struct buffer_head *bh;
+	fmode_t mode = FMODE_READ | (write ? FMODE_WRITE : 0);
+	dev_t dev;
+	u32 size, pos;
+	int rc = 0;
+
+	dev = name_to_dev_t("PARTLABEL=private");
+	if (!dev)
+		return -EPROBE_DEFER;
+
+	bdev = blkdev_get_by_dev(dev, mode, NULL);
+	if (IS_ERR(bdev))
+		return PTR_ERR(bdev);
+
+	size = bdev_logical_block_size(bdev);
+	pos = offset % size;
+	if (offset + MEIZU_F0_SLOT_SIZE > i_size_read(bdev->bd_inode) ||
+	    pos + MEIZU_F0_SLOT_SIZE > size) {
+		rc = -EINVAL;
+		goto put;
+	}
+
+	bh = __bread(bdev, offset / size, size);
+	if (!bh) {
+		rc = -EIO;
+		goto put;
+	}
+
+	lock_buffer(bh);
+	if (write) {
+		memcpy(bh->b_data + pos, data, MEIZU_F0_SLOT_SIZE);
+		mark_buffer_dirty(bh);
+	} else {
+		memcpy(data, bh->b_data + pos, MEIZU_F0_SLOT_SIZE);
+	}
+	unlock_buffer(bh);
+	if (write) {
+		rc = sync_dirty_buffer(bh);
+		if (!rc)
+			rc = blkdev_issue_flush(bdev);
+	}
+	brelse(bh);
+put:
+	blkdev_put(bdev, mode);
+	return rc;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
+static int meizu_f0_load(struct haptics_chip *chip)
+{
+	char data[MEIZU_F0_SLOT_SIZE + 1] = { 0 };
+	u32 period_us;
+	int rc;
+
+	rc = meizu_f0_slot_rw(data, false);
+	if (rc)
+		return rc;
+
+	if (kstrtou32(data, 10, &period_us) || !meizu_f0_valid(period_us))
+		return -ENODATA;
+
+	chip->f0_period_us = period_us;
+	dev_info(chip->dev, "Restored motor F0 period: %u us\n", period_us);
+	return 0;
+}
 
 struct haptics_reg_info {
 	u8 addr;
@@ -2194,7 +2321,7 @@ static int haptics_load_constant_effect(struct haptics_chip *chip, u8 amplitude)
 	int rc = 0;
 
 	mutex_lock(&chip->play.lock);
-	if (chip->play.in_calibration) {
+	if (chip->play.in_calibration || chip->f0_calibrating || realitytap_active(chip)) {
 		dev_err(chip->dev, "calibration in progress, ignore playing constant effect\n");
 		rc = -EBUSY;
 		goto unlock;
@@ -2452,7 +2579,7 @@ static int haptics_load_custom_effect(struct haptics_chip *chip,
 	fifo->play_length_us = get_fifo_play_length_us(fifo,
 			chip->custom_effect->t_lra_us);
 
-	if (chip->play.in_calibration) {
+	if (chip->play.in_calibration || chip->f0_calibrating || realitytap_active(chip)) {
 		dev_err(chip->dev, "calibration in progress, ignore playing custom effect\n");
 		rc = -EBUSY;
 		goto cleanup;
@@ -2557,7 +2684,7 @@ static int haptics_load_periodic_effect(struct haptics_chip *chip,
 	}
 
 	mutex_lock(&chip->play.lock);
-	if (chip->play.in_calibration) {
+	if (chip->play.in_calibration || chip->f0_calibrating || realitytap_active(chip)) {
 		dev_err(chip->dev, "calibration in progress, ignore playing predefined effect\n");
 		rc = -EBUSY;
 		goto unlock;
@@ -2682,13 +2809,13 @@ static int haptics_upload_effect(struct input_dev *dev,
 		amplitude = tmp / 0x7fff;
 		dev_dbg(chip->dev, "upload constant effect, length = %dms, amplitude = %#x\n",
 				length_ms, amplitude);
-		schedule_delayed_work(&chip->stop_work, msecs_to_jiffies(length_ms));
 		rc = haptics_load_constant_effect(chip, amplitude);
 		if (rc < 0) {
 			dev_err(chip->dev, "set direct play failed, rc=%d\n",
 					rc);
 			return rc;
 		}
+		schedule_delayed_work(&chip->stop_work, msecs_to_jiffies(length_ms));
 
 		break;
 	case FF_PERIODIC:
@@ -2757,7 +2884,9 @@ static int haptics_playback(struct input_dev *dev, int effect_id, int val)
 	struct haptics_chip *chip = input_get_drvdata(dev);
 
 	dev_dbg(chip->dev, "playback val = %d\n", val);
-	if (!!val)
+	if (READ_ONCE(chip->f0_calibrating) || realitytap_active(chip))
+		return -EBUSY;
+	if (val)
 		return haptics_enable_play(chip, true);
 
 	return 0;
@@ -2771,6 +2900,10 @@ static int haptics_erase(struct input_dev *dev, int effect_id)
 
 	dev_dbg(chip->dev, "erase effect, really stop play\n");
 	mutex_lock(&play->lock);
+	if (realitytap_active(chip)) {
+		mutex_unlock(&play->lock);
+		return 0;
+	}
 	cancel_delayed_work_sync(&chip->stop_work);
 	if ((play->pattern_src == FIFO) &&
 			atomic_read(&play->fifo_status.is_busy)) {
@@ -2813,6 +2946,10 @@ static void haptics_set_gain_work(struct work_struct *work)
 	u16 gain;
 
 	mutex_lock(&play->lock);
+	if (chip->f0_calibrating || realitytap_active(chip)) {
+		mutex_unlock(&play->lock);
+		return;
+	}
 	gain = atomic_read(&play->gain);
 	/* scale amplitude when playing in DIRECT_PLAY mode */
 	if (chip->play.pattern_src == DIRECT_PLAY) {
@@ -3121,7 +3258,7 @@ static int haptics_init_preload_pattern_effect(struct haptics_chip *chip)
 static int haptics_init_lra_period_config(struct haptics_chip *chip)
 {
 	int rc = 0;
-	u8 val;
+	u8 val, saved[2];
 	u32 t_lra_us;
 
 	/* set AUTO_mode RC CLK calibration by default */
@@ -3138,6 +3275,19 @@ static int haptics_init_lra_period_config(struct haptics_chip *chip)
 		t_lra_us = chip->config.cl_t_lra_us;
 	else
 		dev_warn(chip->dev, "get closeloop LRA period failed, rc=%d\n", rc);
+
+	if (chip->meizu_haptics) {
+		if (meizu_f0_valid(chip->f0_period_us)) {
+			t_lra_us = chip->f0_period_us;
+		} else if (chip->hw_type == HAP525_HV && chip->hap_cfg_nvmem) {
+			rc = nvmem_device_read(chip->hap_cfg_nvmem,
+					HAP_STATUS_DATA_MSB_SDAM_OFFSET, 2, saved);
+			t_lra_us = rc == 2 ? (saved[0] << 8) | saved[1] : 0;
+			if (!meizu_f0_valid(t_lra_us))
+				t_lra_us = MEIZU_F0_DEFAULT_PERIOD_US;
+		}
+		chip->config.cl_t_lra_us = t_lra_us;
+	}
 
 	/* Config T_LRA */
 	return haptics_config_openloop_lra_period(chip, t_lra_us);
@@ -3298,6 +3448,282 @@ static int haptics_hw_init(struct haptics_chip *chip)
 	return haptics_init_fifo_memory(chip);
 }
 
+static void realitytap_clean_buffers(struct realitytap *rt)
+{
+	int i;
+
+	for (i = 0; i < REALITYTAP_BUFFER_COUNT; i++) {
+		WRITE_ONCE(rt->buffers[i].length, 0);
+		/* Publish the reset length before the finished marker. */
+		smp_store_release(&rt->buffers[i].status,
+				REALITYTAP_BUFFER_FINISHED);
+	}
+	rt->index = 0;
+	rt->position = 0;
+	rt->pending = 0;
+}
+
+/* Called with play.lock held; shared link fields are never dereferenced. */
+static int realitytap_collect(struct realitytap *rt, u32 capacity,
+				unsigned int retries, bool *finished)
+{
+	struct realitytap_buffer *buffer;
+	u32 total = rt->pending, num;
+	s16 length;
+	u8 status;
+
+	*finished = false;
+	while (total < capacity && atomic_read(&rt->active)) {
+		buffer = &rt->buffers[rt->index];
+		/* The producer publishes length and samples before VALID. */
+		status = smp_load_acquire(&buffer->status);
+		if (status == REALITYTAP_BUFFER_FINISHED) {
+			*finished = true;
+			break;
+		}
+		length = READ_ONCE(buffer->length);
+		if (status != REALITYTAP_BUFFER_VALID || !length) {
+			if (!retries--) {
+				*finished = true;
+				break;
+			}
+			usleep_range(1000, 1100);
+			continue;
+		}
+		if (length < 0 || length > REALITYTAP_DATA_SIZE ||
+		    rt->position > length)
+			return -EINVAL;
+
+		num = min_t(u32, length - rt->position, capacity - total);
+		memcpy(rt->scratch + total, buffer->data + rt->position, num);
+		total += num;
+		rt->position += num;
+		if (rt->position == length) {
+			WRITE_ONCE(buffer->length, 0);
+			/* Finish reading the samples before returning this slot. */
+			smp_store_release(&buffer->status, REALITYTAP_BUFFER_INVALID);
+			rt->index = (rt->index + 1) % REALITYTAP_BUFFER_COUNT;
+			rt->position = 0;
+		}
+	}
+	return atomic_read(&rt->active) ? total : -ECANCELED;
+}
+
+static int realitytap_write_fifo(struct realitytap *rt, u32 total,
+				bool refill, bool finished)
+{
+	struct haptics_chip *chip = rt->chip;
+	u32 num = finished ? total : round_down(total, HAP_PTN_FIFO_DIN_NUM);
+	int rc;
+
+	if (num) {
+		rc = haptics_update_fifo_samples(chip, rt->scratch, num, refill);
+		if (rc < 0)
+			return rc;
+		chip->play.fifo_status.samples_written += num;
+	}
+	/* Retain an incomplete burst until more samples or the end marker arrive. */
+	rt->pending = total - num;
+	memmove(rt->scratch, rt->scratch + num, rt->pending);
+	return num;
+}
+
+static int realitytap_finish_locked(struct realitytap *rt)
+{
+	struct haptics_chip *chip = rt->chip;
+	int rc, ret;
+
+	atomic_set(&chip->play.fifo_status.written_done, 1);
+	rc = haptics_stop_fifo_play(chip);
+	haptics_fifo_empty_irq_config(chip, false);
+	ret = haptics_set_fifo_empty_threshold(chip, 0);
+	if (!rc)
+		rc = ret;
+	ret = haptics_masked_write(chip, chip->cfg_addr_base,
+			HAP_CFG_CAL_EN_REG, CAL_RC_CLK_MASK,
+			CAL_RC_CLK_AUTO_VAL << CAL_RC_CLK_SHIFT);
+	if (!rc)
+		rc = ret;
+	ret = haptics_enable_hpwr_vreg(chip, false);
+	if (!rc)
+		rc = ret;
+	realitytap_clean_buffers(rt);
+	rt->draining = false;
+	atomic_set(&rt->active, 0);
+	return rc;
+}
+
+static void realitytap_erase_work(struct work_struct *work)
+{
+	struct realitytap *rt = container_of(work, struct realitytap, erase_work);
+	struct haptics_chip *chip = rt->chip;
+	u32 fill;
+	int i, rc = 0;
+
+	/* Let the last FIFO samples drain before disabling the output. */
+	for (i = 0; i < 100 && atomic_read(&rt->active); i++) {
+		mutex_lock(&chip->play.lock);
+		rc = haptics_get_fifo_fill_status(chip, &fill);
+		mutex_unlock(&chip->play.lock);
+		if (rc < 0 || fill <= HAP_PTN_FIFO_DIN_NUM)
+			break;
+		usleep_range(1000, 1100);
+	}
+	mutex_lock(&chip->play.lock);
+	if (atomic_read(&rt->active))
+		rc = realitytap_finish_locked(rt);
+	mutex_unlock(&chip->play.lock);
+	if (rc < 0)
+		dev_err(chip->dev, "Stop RealityTap stream failed: %d\n", rc);
+}
+
+static void realitytap_drain(struct realitytap *rt)
+{
+	if (!atomic_read(&rt->active))
+		return;
+	rt->draining = true;
+	atomic_set(&rt->chip->play.fifo_status.written_done, 1);
+	haptics_set_fifo_empty_threshold(rt->chip, 0);
+	schedule_work(&rt->erase_work);
+}
+
+static void realitytap_refill(struct realitytap *rt)
+{
+	struct haptics_chip *chip = rt->chip;
+	bool finished;
+	int available, total, rc;
+
+	if (rt->draining || !atomic_read(&rt->active))
+		return;
+	available = haptics_get_available_fifo_memory(chip);
+	if (available < 0)
+		goto drain;
+	/* An empty FIFO means this stream has underrun; do not restart it. */
+	if (available == get_max_fifo_samples(chip))
+		goto drain;
+	available = round_down(available, HAP_PTN_FIFO_DIN_NUM);
+	if (!available)
+		return;
+
+	total = realitytap_collect(rt, available, 3, &finished);
+	if (total < 0)
+		goto drain;
+	rc = realitytap_write_fifo(rt, total, true, finished);
+	if (rc < 0)
+		goto drain;
+	if (!finished)
+		return;
+drain:
+	realitytap_drain(rt);
+}
+
+static void realitytap_stream_work(struct work_struct *work)
+{
+	struct realitytap *rt = container_of(work, struct realitytap, stream_work);
+	struct haptics_chip *chip = rt->chip;
+	struct fifo_play_status *status = &chip->play.fifo_status;
+	bool finished;
+	u32 capacity;
+	int i, total, num, rc = 0;
+
+	for (i = 0; i < 100 && atomic_read(&rt->active); i++) {
+		/* Pair with the producer's publication of the first buffer. */
+		if (smp_load_acquire(&rt->buffers[0].status) ==
+				REALITYTAP_BUFFER_VALID &&
+		    READ_ONCE(rt->buffers[0].length) > 0)
+			break;
+		usleep_range(1000, 1100);
+	}
+
+	mutex_lock(&chip->play.lock);
+	if (!atomic_read(&rt->active))
+		goto unlock;
+	if (i == 100) {
+		rc = -ETIMEDOUT;
+		goto stop;
+	}
+	capacity = min_t(u32, get_max_fifo_samples(chip), rt->scratch_size);
+	total = realitytap_collect(rt, capacity, 30, &finished);
+	if (total <= 0) {
+		rc = total ? total : -ENODATA;
+		goto stop;
+	}
+	rc = haptics_set_vmax_mv(chip, rt->vmax_mv);
+	if (rc < 0)
+		goto stop;
+	rc = haptics_enable_autores(chip, false);
+	if (rc < 0)
+		goto stop;
+	rc = haptics_toggle_module_enable(chip);
+	if (rc < 0)
+		goto stop;
+	rc = haptics_masked_write(chip, chip->cfg_addr_base,
+			HAP_CFG_CAL_EN_REG, CAL_RC_CLK_MASK,
+			CAL_RC_CLK_DISABLED_VAL << CAL_RC_CLK_SHIFT);
+	if (rc < 0)
+		goto stop;
+	rc = haptics_set_fifo_playrate(chip, F_24KHZ);
+	if (rc < 0)
+		goto stop;
+	status->samples_written = 0;
+	num = realitytap_write_fifo(rt, total, false, finished);
+	if (num <= 0) {
+		rc = num ? num : -ENODATA;
+		goto stop;
+	}
+	chip->play.effect = NULL;
+	chip->play.brake = NULL;
+	chip->play.pattern_src = FIFO;
+	chip->play.vmax_mv = rt->vmax_mv;
+	atomic_set(&status->cancelled, 0);
+	atomic_set(&status->written_done, 0);
+	atomic_set(&status->is_busy, 1);
+	/* Stock RealityTap refills at 480 samples for its fixed 24 kHz stream. */
+	rc = haptics_set_fifo_empty_threshold(chip, finished ? 0 : 480);
+	if (rc < 0)
+		goto stop;
+	rc = haptics_enable_hpwr_vreg(chip, true);
+	if (rc < 0)
+		goto stop;
+	rc = haptics_wait_hboost_ready(chip);
+	if (rc < 0)
+		goto stop;
+	rc = haptics_enable_play(chip, true);
+	if (rc < 0)
+		goto stop;
+	haptics_fifo_empty_irq_config(chip, true);
+	if (finished)
+		realitytap_drain(rt);
+	goto unlock;
+stop:
+	realitytap_finish_locked(rt);
+unlock:
+	mutex_unlock(&chip->play.lock);
+	if (rc < 0 && rc != -ECANCELED)
+		dev_err(chip->dev, "Start RealityTap stream failed: %d\n", rc);
+}
+
+/* Serialize control operations separately from the FIFO IRQ's play.lock. */
+static int realitytap_stop(struct realitytap *rt, bool clean)
+{
+	struct haptics_chip *chip = rt->chip;
+	bool active;
+	int rc = 0;
+
+	atomic_set(&rt->stopping, 1);
+	active = atomic_xchg(&rt->active, 0);
+	cancel_work_sync(&rt->stream_work);
+	cancel_work_sync(&rt->erase_work);
+	mutex_lock(&chip->play.lock);
+	if (active || rt->draining)
+		rc = realitytap_finish_locked(rt);
+	else if (clean)
+		realitytap_clean_buffers(rt);
+	mutex_unlock(&chip->play.lock);
+	atomic_set(&rt->stopping, 0);
+	return rc;
+}
+
 static irqreturn_t fifo_empty_irq_handler(int irq, void *data)
 {
 	struct haptics_chip *chip = data;
@@ -3312,10 +3738,24 @@ static irqreturn_t fifo_empty_irq_handler(int irq, void *data)
 	if (rc < 0)
 		return IRQ_HANDLED;
 
-	if (!(val & FIFO_EMPTY_BIT))
+	if (!(val & FIFO_EMPTY_BIT)) {
+		if (realitytap_active(chip)) {
+			u32 fill;
+
+			mutex_lock(&chip->play.lock);
+			if (realitytap_active(chip) &&
+			    !haptics_get_fifo_fill_status(chip, &fill) && fill < 24)
+				realitytap_drain(chip->realitytap);
+			mutex_unlock(&chip->play.lock);
+		}
 		return IRQ_HANDLED;
+	}
 
 	mutex_lock(&chip->play.lock);
+	if (realitytap_active(chip)) {
+		realitytap_refill(chip->realitytap);
+		goto unlock;
+	}
 	status = &chip->play.fifo_status;
 	if (atomic_read(&status->written_done) == 1) {
 		/*
@@ -5287,7 +5727,7 @@ static int haptics_enable_autores_cal(struct haptics_chip *chip, bool enable)
 #define LRA_CALIBRATION_VMAX_HDRM_MV	500
 static int haptics_detect_lra_frequency(struct haptics_chip *chip)
 {
-	int rc;
+	int rc, ret;
 	u8 autores_cfg, drv_duty_cfg, amplitude, mask, val = 0;
 	u32 vmax_mv = chip->config.vmax_mv_cali;
 
@@ -5412,25 +5852,32 @@ static int haptics_detect_lra_frequency(struct haptics_chip *chip)
 	if (rc < 0)
 		goto restore;
 
-	if (chip->config.sw_cmd_freq_det)
-		haptics_enable_autores_cal(chip, false);
+	if (chip->config.sw_cmd_freq_det) {
+		rc = haptics_enable_autores_cal(chip, false);
+		if (rc < 0)
+			goto restore;
+	}
 
-	haptics_config_openloop_lra_period(chip, chip->config.cl_t_lra_us);
+	rc = haptics_config_openloop_lra_period(chip, chip->config.cl_t_lra_us);
 
 restore:
 	/* Disable play in case it's not been disabled */
-	haptics_enable_play(chip, false);
-	rc = haptics_enable_hpwr_vreg(chip, false);
-	if (rc < 0)
-		return rc;
+	ret = haptics_enable_play(chip, false);
+	if (!rc && ret < 0)
+		rc = ret;
+	ret = haptics_enable_hpwr_vreg(chip, false);
+	if (!rc && ret < 0)
+		rc = ret;
 
-	rc = haptics_write(chip, chip->cfg_addr_base,
+	ret = haptics_write(chip, chip->cfg_addr_base,
 			HAP_CFG_AUTORES_CFG_REG, &autores_cfg, 1);
-	if (rc < 0)
-		return rc;
+	if (!rc && ret < 0)
+		rc = ret;
 
-	rc = haptics_write(chip, chip->cfg_addr_base,
+	ret = haptics_write(chip, chip->cfg_addr_base,
 			HAP_CFG_DRV_DUTY_CFG_REG, &drv_duty_cfg, 1);
+	if (!rc && ret < 0)
+		rc = ret;
 
 	return rc;
 }
@@ -5440,6 +5887,10 @@ static int haptics_start_lra_calibrate(struct haptics_chip *chip)
 	int rc;
 
 	mutex_lock(&chip->play.lock);
+	if (realitytap_active(chip)) {
+		rc = -EBUSY;
+		goto unlock;
+	}
 	/*
 	 * Ignore calibration if it's in FIFO playing to avoid
 	 * messing up the FIFO playing status
@@ -5483,6 +5934,87 @@ unlock:
 	return rc;
 }
 
+static int meizu_f0_save(struct haptics_chip *chip)
+{
+	char data[MEIZU_F0_SLOT_SIZE] = { 0 };
+	u32 period_us = chip->config.cl_t_lra_us;
+	u8 value[2] = { period_us >> 8, period_us & 0xff };
+	int rc;
+
+	if (!meizu_f0_valid(period_us))
+		return -EINVAL;
+
+	if (chip->hap_cfg_nvmem) {
+		rc = nvmem_device_write(chip->hap_cfg_nvmem,
+				HAP_STATUS_DATA_MSB_SDAM_OFFSET, 2, value);
+		if (rc != 2)
+			return rc < 0 ? rc : -EIO;
+	}
+
+	rc = meizu_f0_slot_rw(data, false);
+	if (rc)
+		return rc;
+	scnprintf(data, sizeof(data), "%u", period_us);
+	rc = meizu_f0_slot_rw(data, true);
+	if (!rc)
+		chip->f0_period_us = period_us;
+	return rc;
+}
+
+static int meizu_f0_calibrate(struct haptics_chip *chip)
+{
+	struct ff_device *ff = chip->input_dev ? chip->input_dev->ff : NULL;
+	u32 calibration_mv;
+	int attempt, rc;
+
+	mutex_lock(&chip->f0_lock);
+	if (chip->realitytap && READ_ONCE(chip->realitytap->suspended)) {
+		rc = -EBUSY;
+		goto unlock;
+	}
+	/* Prevent a concurrent FF upload from arming another stop timer. */
+	if (ff)
+		mutex_lock(&ff->mutex);
+	mutex_lock(&chip->play.lock);
+	if (chip->play.in_calibration || realitytap_active(chip)) {
+		mutex_unlock(&chip->play.lock);
+		rc = -EBUSY;
+		goto unlock_ff;
+	}
+	WRITE_ONCE(chip->f0_calibrating, true);
+	mutex_unlock(&chip->play.lock);
+	cancel_delayed_work_sync(&chip->stop_work);
+	cancel_work_sync(&chip->set_gain_work);
+
+	calibration_mv = chip->config.vmax_mv_cali;
+	for (attempt = 0; attempt < MEIZU_F0_ATTEMPTS; attempt++) {
+		/* The stock motor calibration raises Vmax on its third attempt. */
+		chip->config.vmax_mv_cali = attempt >= 2 ? 2500 : calibration_mv;
+		rc = haptics_start_lra_calibrate(chip);
+		if (rc < 0)
+			goto restore;
+		if (meizu_f0_valid(chip->config.cl_t_lra_us))
+			break;
+	}
+
+	mutex_lock(&chip->play.lock);
+	if (!meizu_f0_valid(chip->config.cl_t_lra_us))
+		chip->config.cl_t_lra_us = MEIZU_F0_DEFAULT_PERIOD_US;
+	rc = haptics_config_openloop_lra_period(chip, chip->config.cl_t_lra_us);
+	if (!rc)
+		rc = meizu_f0_save(chip);
+	mutex_unlock(&chip->play.lock);
+restore:
+	chip->config.vmax_mv_cali = calibration_mv;
+	WRITE_ONCE(chip->f0_calibrating, false);
+unlock_ff:
+	if (ff)
+		mutex_unlock(&ff->mutex);
+unlock:
+	mutex_unlock(&chip->f0_lock);
+	return rc;
+}
+
 static ssize_t lra_calibration_store(struct class *c,
 		struct class_attribute *attr, const char *buf, size_t count)
 {
@@ -5495,7 +6027,8 @@ static ssize_t lra_calibration_store(struct class *c,
 		return -EINVAL;
 
 	if (val) {
-		rc = haptics_start_lra_calibrate(chip);
+		rc = chip->meizu_haptics ? meizu_f0_calibrate(chip) :
+			haptics_start_lra_calibrate(chip);
 		if (rc < 0)
 			return rc;
 	}
@@ -5579,14 +6112,319 @@ static ssize_t primitive_duration_store(struct class *c,
 
 static CLASS_ATTR_RW(primitive_duration);
 
+static ssize_t lra_vmax_mv_show(struct class *c,
+		struct class_attribute *attr, char *buf)
+{
+	struct haptics_chip *chip = container_of(c, struct haptics_chip, hap_class);
+
+	return scnprintf(buf, PAGE_SIZE, "vmax = %u mV\n", chip->config.vmax_mv);
+}
+
+static ssize_t lra_vmax_mv_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	struct haptics_chip *chip = container_of(c, struct haptics_chip, hap_class);
+	u32 value;
+
+	if (kstrtou32(buf, 0, &value) || value > MAX_VMAX_MV)
+		return -EINVAL;
+	mutex_lock(&chip->play.lock);
+	chip->config.vmax_mv = value;
+	mutex_unlock(&chip->play.lock);
+	return count;
+}
+static CLASS_ATTR_RW(lra_vmax_mv);
+
+static ssize_t lra_cali_vmax_mv_show(struct class *c,
+		struct class_attribute *attr, char *buf)
+{
+	struct haptics_chip *chip = container_of(c, struct haptics_chip, hap_class);
+
+	return scnprintf(buf, PAGE_SIZE, "cali vmax = %u mV\n",
+			chip->config.vmax_mv_cali);
+}
+
+static ssize_t lra_cali_vmax_mv_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	struct haptics_chip *chip = container_of(c, struct haptics_chip, hap_class);
+	u32 value;
+
+	if (kstrtou32(buf, 0, &value) || value > MAX_VMAX_MV)
+		return -EINVAL;
+	mutex_lock(&chip->f0_lock);
+	chip->config.vmax_mv_cali = value;
+	mutex_unlock(&chip->f0_lock);
+	return count;
+}
+static CLASS_ATTR_RW(lra_cali_vmax_mv);
+
 static struct attribute *hap_class_attrs[] = {
 	&class_attr_lra_calibration.attr,
 	&class_attr_lra_frequency_hz.attr,
 	&class_attr_lra_impedance.attr,
 	&class_attr_primitive_duration.attr,
+	&class_attr_lra_vmax_mv.attr,
+	&class_attr_lra_cali_vmax_mv.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(hap_class);
+
+static void realitytap_release(struct kref *ref)
+{
+	struct realitytap *rt = container_of(ref, struct realitytap, ref);
+
+	if (rt->buffers)
+		free_pages((unsigned long)rt->buffers, get_order(REALITYTAP_MMAP_SIZE));
+	kfree(rt->scratch);
+	kfree(rt);
+}
+
+static int realitytap_open(struct inode *inode, struct file *file)
+{
+	struct realitytap *rt = container_of(file->private_data,
+			struct realitytap, misc);
+	int rc = 0;
+
+	mutex_lock(&rt->lock);
+	if (!rt->chip)
+		rc = -ENODEV;
+	else {
+		kref_get(&rt->ref);
+		file->private_data = rt;
+	}
+	mutex_unlock(&rt->lock);
+	return rc;
+}
+
+static int realitytap_close(struct inode *inode, struct file *file)
+{
+	struct realitytap *rt = file->private_data;
+
+	kref_put(&rt->ref, realitytap_release);
+	return 0;
+}
+
+static ssize_t realitytap_read(struct file *file, char __user *buf,
+				size_t count, loff_t *pos)
+{
+	return 0;
+}
+
+static ssize_t realitytap_write(struct file *file, const char __user *buf,
+				size_t count, loff_t *pos)
+{
+	return 0;
+}
+
+static void realitytap_vma_open(struct vm_area_struct *vma)
+{
+	struct realitytap *rt = vma->vm_private_data;
+
+	kref_get(&rt->ref);
+}
+
+static void realitytap_vma_close(struct vm_area_struct *vma)
+{
+	struct realitytap *rt = vma->vm_private_data;
+
+	kref_put(&rt->ref, realitytap_release);
+}
+
+static const struct vm_operations_struct realitytap_vm_ops = {
+	.open = realitytap_vma_open,
+	.close = realitytap_vma_close,
+};
+
+static int realitytap_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct realitytap *rt = file->private_data;
+	int rc;
+
+	if (vma->vm_pgoff || vma->vm_end - vma->vm_start != REALITYTAP_MMAP_SIZE ||
+	    !(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
+		return -EINVAL;
+	mutex_lock(&rt->lock);
+	if (!rt->chip) {
+		rc = -ENODEV;
+		goto unlock;
+	}
+	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+	rc = remap_pfn_range(vma, vma->vm_start,
+			virt_to_phys(rt->buffers) >> PAGE_SHIFT,
+			REALITYTAP_MMAP_SIZE, vma->vm_page_prot);
+	if (!rc) {
+		vma->vm_ops = &realitytap_vm_ops;
+		vma->vm_private_data = rt;
+		realitytap_vma_open(vma);
+	}
+unlock:
+	mutex_unlock(&rt->lock);
+	return rc;
+}
+
+static long realitytap_ioctl(struct file *file, unsigned int cmd,
+				unsigned long arg)
+{
+	struct realitytap *rt = file->private_data;
+	struct haptics_chip *chip;
+	struct ff_device *ff;
+	u32 value;
+	int rc = 0;
+
+	mutex_lock(&rt->lock);
+	chip = rt->chip;
+	if (!chip) {
+		rc = -ENODEV;
+		goto unlock;
+	}
+	if (rt->suspended) {
+		rc = -EBUSY;
+		goto unlock;
+	}
+	switch (cmd) {
+	case REALITYTAP_GET_HWINFO:
+		value = 5;
+		if (copy_to_user((void __user *)arg, &value, sizeof(value)))
+			rc = -EFAULT;
+		break;
+	case REALITYTAP_GET_F0:
+		mutex_lock(&chip->play.lock);
+		value = chip->config.cl_t_lra_us;
+		mutex_unlock(&chip->play.lock);
+		if (!value) {
+			rc = -EINVAL;
+			break;
+		}
+		value = (USEC_PER_SEC / value) * 10;
+		if (copy_to_user((void __user *)arg, &value, sizeof(value)))
+			rc = -EFAULT;
+		break;
+	case REALITYTAP_SETTING_GAIN:
+		mutex_lock(&chip->play.lock);
+		rt->vmax_mv = (chip->config.vmax_mv * min(arg, 128UL)) / 128;
+		if (atomic_read(&rt->active)) {
+			chip->play.vmax_mv = rt->vmax_mv;
+			rc = haptics_set_vmax_mv(chip, rt->vmax_mv);
+		}
+		mutex_unlock(&chip->play.lock);
+		break;
+	case REALITYTAP_STREAM_MODE:
+		ff = chip->input_dev->ff;
+		mutex_lock(&ff->mutex);
+		rc = realitytap_stop(rt, false);
+		if (rc < 0) {
+			mutex_unlock(&ff->mutex);
+			break;
+		}
+		cancel_delayed_work_sync(&chip->stop_work);
+		cancel_work_sync(&chip->set_gain_work);
+		mutex_lock(&chip->play.lock);
+		if (chip->play.in_calibration || chip->f0_calibrating) {
+			rc = -EBUSY;
+		} else {
+			rc = atomic_read(&chip->play.fifo_status.is_busy) ?
+				haptics_stop_fifo_play(chip) :
+				haptics_enable_play(chip, false);
+			if (!rc) {
+				rt->index = 0;
+				rt->position = 0;
+				rt->pending = 0;
+				atomic_set(&rt->active, 1);
+				queue_work(system_highpri_wq, &rt->stream_work);
+			}
+		}
+		mutex_unlock(&chip->play.lock);
+		mutex_unlock(&ff->mutex);
+		break;
+	case REALITYTAP_STOP_MODE:
+		rc = realitytap_stop(rt, true);
+		break;
+	case REALITYTAP_F0_CALIBRATE:
+		rc = meizu_f0_calibrate(chip);
+		break;
+	case _IO('R', 0x06):
+	case _IO('R', 0x09):
+		/* These commands are accepted as no-ops by the stock module. */
+		break;
+	default:
+		rc = -ENOTTY;
+		break;
+	}
+unlock:
+	mutex_unlock(&rt->lock);
+	return rc;
+}
+
+static const struct file_operations realitytap_fops = {
+	.owner = THIS_MODULE,
+	.open = realitytap_open,
+	.release = realitytap_close,
+	.read = realitytap_read,
+	.write = realitytap_write,
+	.unlocked_ioctl = realitytap_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = realitytap_ioctl,
+#endif
+	.mmap = realitytap_mmap,
+	.llseek = no_llseek,
+};
+
+static int realitytap_register(struct haptics_chip *chip)
+{
+	struct realitytap *rt;
+	int rc;
+
+	BUILD_BUG_ON(sizeof(struct realitytap_buffer) != 1024);
+	rt = kzalloc(sizeof(*rt), GFP_KERNEL);
+	if (!rt)
+		return -ENOMEM;
+	kref_init(&rt->ref);
+	mutex_init(&rt->lock);
+	INIT_WORK(&rt->stream_work, realitytap_stream_work);
+	INIT_WORK(&rt->erase_work, realitytap_erase_work);
+	rt->scratch_size = get_max_fifo_samples(chip);
+	rt->scratch = kmalloc(rt->scratch_size, GFP_KERNEL);
+	rt->buffers = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
+			get_order(REALITYTAP_MMAP_SIZE));
+	if (!rt->buffers || !rt->scratch) {
+		rc = -ENOMEM;
+		goto put;
+	}
+	realitytap_clean_buffers(rt);
+	rt->chip = chip;
+	rt->vmax_mv = chip->config.vmax_mv;
+	rt->misc.minor = MISC_DYNAMIC_MINOR;
+	rt->misc.name = "awa_realitytap_dev";
+	rt->misc.fops = &realitytap_fops;
+	rt->misc.parent = chip->dev;
+	chip->realitytap = rt;
+	rc = misc_register(&rt->misc);
+	if (rc) {
+		chip->realitytap = NULL;
+		goto put;
+	}
+	return 0;
+put:
+	kref_put(&rt->ref, realitytap_release);
+	return rc;
+}
+
+static void realitytap_unregister(struct haptics_chip *chip)
+{
+	struct realitytap *rt = chip->realitytap;
+
+	if (!rt)
+		return;
+	misc_deregister(&rt->misc);
+	mutex_lock(&rt->lock);
+	realitytap_stop(rt, true);
+	synchronize_irq(chip->fifo_empty_irq);
+	rt->chip = NULL;
+	chip->realitytap = NULL;
+	mutex_unlock(&rt->lock);
+	kref_put(&rt->ref, realitytap_release);
+}
 
 static bool is_swr_supported(struct haptics_chip *chip)
 {
@@ -5646,6 +6484,8 @@ static int haptics_probe(struct platform_device *pdev)
 	struct haptics_chip *chip;
 	struct input_dev *input_dev;
 	struct ff_device *ff_dev;
+	const char *model;
+	bool calibrate_f0 = false;
 	int rc, count;
 
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
@@ -5676,6 +6516,19 @@ static int haptics_probe(struct platform_device *pdev)
 	}
 
 	mutex_init(&chip->vmax_lock);
+	mutex_init(&chip->play.lock);
+	mutex_init(&chip->f0_lock);
+	chip->meizu_haptics = !of_property_read_string(of_root, "model", &model) &&
+		!strncmp(model, "Meizu M2468", strlen("Meizu M2468"));
+	if (chip->meizu_haptics) {
+		rc = meizu_f0_load(chip);
+		if (rc == -EPROBE_DEFER)
+			return rc;
+		if (rc == -ENODATA)
+			calibrate_f0 = true;
+		else if (rc)
+			dev_warn(chip->dev, "Read motor F0 slot failed: %d\n", rc);
+	}
 
 	rc = haptics_hw_init(chip);
 	if (rc < 0) {
@@ -5701,7 +6554,6 @@ static int haptics_probe(struct platform_device *pdev)
 		return rc;
 	}
 
-	mutex_init(&chip->play.lock);
 	disable_irq_nosync(chip->fifo_empty_irq);
 	chip->fifo_empty_irq_en = false;
 	hrtimer_init(&chip->hbst_off_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -5715,6 +6567,11 @@ static int haptics_probe(struct platform_device *pdev)
 	input_dev->name = "qcom-hv-haptics";
 	input_set_drvdata(input_dev, chip);
 	chip->input_dev = input_dev;
+	if (calibrate_f0) {
+		rc = meizu_f0_calibrate(chip);
+		if (rc < 0)
+			dev_warn(chip->dev, "Motor F0 calibration failed: %d\n", rc);
+	}
 
 	input_set_capability(input_dev, EV_FF, FF_CONSTANT);
 	input_set_capability(input_dev, EV_FF, FF_GAIN);
@@ -5740,12 +6597,6 @@ static int haptics_probe(struct platform_device *pdev)
 	ff_dev->playback = haptics_playback;
 	ff_dev->erase = haptics_erase;
 	ff_dev->set_gain = haptics_set_gain;
-	rc = input_register_device(input_dev);
-	if (rc < 0) {
-		dev_err(chip->dev, "register input device failed, rc=%d\n",
-				rc);
-		goto destroy_ff;
-	}
 
 	dev_set_drvdata(chip->dev, chip);
 	chip->hap_class.name = "qcom-haptics";
@@ -5753,6 +6604,22 @@ static int haptics_probe(struct platform_device *pdev)
 	rc = class_register(&chip->hap_class);
 	if (rc < 0) {
 		dev_err(chip->dev, "register hap_class failed, rc=%d\n", rc);
+		goto destroy_ff;
+	}
+
+	if (chip->meizu_haptics) {
+		rc = realitytap_register(chip);
+		if (rc < 0) {
+			class_unregister(&chip->hap_class);
+			goto destroy_ff;
+		}
+	}
+
+	rc = input_register_device(input_dev);
+	if (rc < 0) {
+		dev_err(chip->dev, "register input device failed, rc=%d\n", rc);
+		class_unregister(&chip->hap_class);
+		realitytap_unregister(chip);
 		goto destroy_ff;
 	}
 
@@ -5772,16 +6639,28 @@ destroy_ff:
 static int haptics_remove(struct platform_device *pdev)
 {
 	struct haptics_chip *chip = dev_get_drvdata(&pdev->dev);
+	struct realitytap *rt = chip->realitytap;
 
 	if (chip->pbs_node)
 		of_node_put(chip->pbs_node);
 
 	unregister_hboost_event_notifier(&chip->hboost_nb);
 	class_unregister(&chip->hap_class);
+	/* Existing misc-device files must stop using the FF device first. */
+	if (rt) {
+		mutex_lock(&rt->lock);
+		WRITE_ONCE(rt->suspended, true);
+		realitytap_stop(rt, true);
+		mutex_unlock(&rt->lock);
+	}
+	input_unregister_device(chip->input_dev);
+	cancel_delayed_work_sync(&chip->stop_work);
+	cancel_work_sync(&chip->set_gain_work);
+	realitytap_unregister(chip);
+	hrtimer_cancel(&chip->hbst_off_timer);
 #ifdef CONFIG_DEBUG_FS
 	debugfs_remove_recursive(chip->debugfs_dir);
 #endif
-	input_unregister_device(chip->input_dev);
 	dev_set_drvdata(chip->dev, NULL);
 
 	return 0;
@@ -5824,7 +6703,7 @@ static int haptics_ds_resume_config(struct device *dev)
 }
 
 #ifdef CONFIG_PM_SLEEP
-static int haptics_suspend_config(struct device *dev)
+static int haptics_suspend_hw(struct device *dev)
 {
 	struct haptics_chip *chip = dev_get_drvdata(dev);
 	struct haptics_play_info *play = &chip->play;
@@ -5869,6 +6748,33 @@ static int haptics_suspend_config(struct device *dev)
 	return haptics_module_enable(chip, false);
 }
 
+static int haptics_suspend_config(struct device *dev)
+{
+	struct haptics_chip *chip = dev_get_drvdata(dev);
+	struct realitytap *rt = chip->realitytap;
+	int rc;
+
+	if (rt) {
+		mutex_lock(&rt->lock);
+		WRITE_ONCE(rt->suspended, true);
+		rc = realitytap_stop(rt, true);
+		mutex_unlock(&rt->lock);
+		if (rc < 0)
+			goto restore;
+	}
+	/* Wait for all calibration attempts before powering down the module. */
+	mutex_lock(&chip->f0_lock);
+	rc = haptics_suspend_hw(dev);
+	mutex_unlock(&chip->f0_lock);
+restore:
+	if (rc < 0 && rt) {
+		mutex_lock(&rt->lock);
+		WRITE_ONCE(rt->suspended, false);
+		mutex_unlock(&rt->lock);
+	}
+	return rc;
+}
+
 static int haptics_suspend(struct device *dev)
 {
 	struct haptics_chip *chip = dev_get_drvdata(dev);
@@ -5892,6 +6798,7 @@ static int haptics_suspend(struct device *dev)
 static int haptics_resume(struct device *dev)
 {
 	struct haptics_chip *chip = dev_get_drvdata(dev);
+	int rc;
 
 #ifdef CONFIG_DEEPSLEEP
 	if (pm_suspend_via_firmware()) {
@@ -5903,7 +6810,13 @@ static int haptics_resume(struct device *dev)
 	}
 #endif
 
-	return haptics_module_enable(chip, true);
+	rc = haptics_module_enable(chip, true);
+	if (!rc && chip->realitytap) {
+		mutex_lock(&chip->realitytap->lock);
+		chip->realitytap->suspended = false;
+		mutex_unlock(&chip->realitytap->lock);
+	}
+	return rc;
 }
 #endif
 
@@ -5929,7 +6842,13 @@ static int haptics_restore(struct device *dev)
 	if (rc < 0)
 		return rc;
 
-	return haptics_module_enable(chip, true);
+	rc = haptics_module_enable(chip, true);
+	if (!rc && chip->realitytap) {
+		mutex_lock(&chip->realitytap->lock);
+		chip->realitytap->suspended = false;
+		mutex_unlock(&chip->realitytap->lock);
+	}
+	return rc;
 }
 
 static void haptics_shutdown(struct platform_device *pdev)
@@ -5975,3 +6894,5 @@ module_platform_driver(haptics_driver);
 
 MODULE_DESCRIPTION("Qualcomm Technologies, Inc. High-Voltage Haptics driver");
 MODULE_LICENSE("GPL v2");
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);
+MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
